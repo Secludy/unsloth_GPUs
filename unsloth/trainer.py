@@ -29,6 +29,7 @@ from unsloth_zoo.vision_utils import (
 )
 from packaging.version import Version
 import dataclasses
+from .dp_utils import DPOptimizer, RDPAccountant
 
 __all__ = [
     "UnslothTrainingArguments",
@@ -71,6 +72,22 @@ class UnslothTrainingArguments(TrainingArguments):
     embedding_learning_rate : Optional[float] = field(
         default = None,
         metadata = {"help" : "Different learning rates for embeddings and lm_head."}
+    )
+    dp_noise_multiplier : Optional[float] = field(
+        default = None,
+        metadata = {"help" : "Gaussian noise multiplier for differential privacy"}
+    )
+    dp_clip_norm : Optional[float] = field(
+        default = None,
+        metadata = {"help" : "Max gradient norm for differential privacy"}
+    )
+    dp_sample_rate : Optional[float] = field(
+        default = None,
+        metadata = {"help" : "Sample rate used for DP accountant"}
+    )
+    dp_target_delta : float = field(
+        default = 1e-6,
+        metadata = {"help" : "Target delta for RDP accountant"}
     )
 pass
 
@@ -122,19 +139,43 @@ pass
 class UnslothTrainer(SFTTrainer):
     def create_optimizer(self):
         embedding_learning_rate = getattr(self.args, "embedding_learning_rate", None)
-        if embedding_learning_rate is None: return super().create_optimizer()
 
         if self.optimizer is None:
             optimizer_cls, optimizer_kwargs = SFTTrainer.get_optimizer_cls_and_kwargs(self.args)
-            self.optimizer = _create_unsloth_optimizer(
-                self.model,
-                optimizer_cls,
-                optimizer_kwargs,
-                embedding_learning_rate,
-            )
-        pass
+            if embedding_learning_rate is None:
+                self.optimizer = optimizer_cls(self.model.parameters(), **optimizer_kwargs)
+            else:
+                self.optimizer = _create_unsloth_optimizer(
+                    self.model,
+                    optimizer_cls,
+                    optimizer_kwargs,
+                    embedding_learning_rate,
+                )
+
+            dp_noise = getattr(self.args, "dp_noise_multiplier", None)
+            dp_norm = getattr(self.args, "dp_clip_norm", None)
+            if (dp_noise is not None) and (dp_norm is not None):
+                sample_rate = getattr(self.args, "dp_sample_rate", 1.0)
+                delta = getattr(self.args, "dp_target_delta", 1e-6)
+                self.dp_accountant = RDPAccountant(
+                    noise_multiplier=dp_noise,
+                    sample_rate=sample_rate,
+                    target_delta=delta,
+                )
+                self.optimizer = DPOptimizer(
+                    self.optimizer,
+                    max_grad_norm=dp_norm,
+                    noise_multiplier=dp_noise,
+                    sample_rate=sample_rate,
+                    accountant=self.dp_accountant,
+                )
         return self.optimizer
     pass
+
+    def get_dp_epsilon(self):
+        if hasattr(self, "dp_accountant"):
+            return self.dp_accountant.get_epsilon()
+        return None
 pass
 
 # From `trl>=0.13.0`, they changed how to pass several params to the trainer
